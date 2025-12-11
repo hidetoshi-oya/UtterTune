@@ -28,7 +28,7 @@ import safetensors.torch as st
 import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
-from peft import PeftModel
+from peft import PeftConfig, PeftModel
 
 from scripts.cv2.patch import apply_patch
 
@@ -49,6 +49,10 @@ logger.propagate = False
 
 def load_wav(path: Path, sr_out: int) -> np.ndarray:
     wav, sr = torchaudio.load(path)
+
+    # Convert stereo to mono by averaging channels
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
 
     if sr != sr_out:
         wav = torchaudio.functional.resample(wav, sr, sr_out)
@@ -151,9 +155,13 @@ def main():
         logger.info("Loading LoRA from %s", args.lora_dir)
 
         # Load LoRA weights
+        # Override task_type to avoid PeftModelForCausalLM requiring prepare_inputs_for_generation
+        peft_config = PeftConfig.from_pretrained(args.lora_dir)
+        peft_config.task_type = None
         hf_model = PeftModel.from_pretrained(
             base_model,
             args.lora_dir,
+            config=peft_config,
             is_trainable=False,
             torch_dtype=torch.float32,
         )
@@ -193,6 +201,12 @@ def main():
     else:
         prompt_text = args.prompt_text
 
+    # Cache prompt embedding for faster inference
+    spk_id = "cached_prompt_spk"
+    t_cache = time.perf_counter()
+    cv2.add_zero_shot_spk(prompt_text, prompt_speech_16k, spk_id)
+    logger.info(f"Prompt embedding cached in {time.perf_counter() - t_cache:.3f}s")
+
     for idx, sentence in enumerate(sentences):
         logger.info(f"[ {idx + 1:03d} ] \u270d︎ '{sentence[:30]}...' → synth...")
 
@@ -202,6 +216,7 @@ def main():
             tts_text=sentence,
             prompt_text=prompt_text,
             prompt_speech_16k=prompt_speech_16k,
+            zero_shot_spk_id=spk_id,
         )
 
         wav_dict = next(wav_iter)  # {'tts_speech': Tensor(1,T)}

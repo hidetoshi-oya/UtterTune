@@ -195,3 +195,8 @@ pyrightconfig.json
 lora_weights
 pretrained_models
 venvs/
+
+prompts/wav/*
+wavs_out/
+.claude/
+.serena/

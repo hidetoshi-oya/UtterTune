@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -72,7 +73,6 @@ def merge_lora_and_export_vllm(
             logger.info("Aborted.")
             return
         # Remove existing directory
-        import shutil
         shutil.rmtree(output_path)
 
     logger.info("=" * 60)
@@ -137,6 +137,16 @@ def merge_lora_and_export_vllm(
         rows = rows.to(dtype=embed_weight.dtype)
         embed_weight[new_ids] = rows
     logger.info("Special token embeddings patched.")
+
+    # 5.1. Copy embed_patch to output directory for vLLM tokenizer loading
+    # NOTE: Use .pt extension to avoid vLLM trying to load it as model weights
+    # (vLLM auto-loads all .safetensors files in the model directory)
+    embed_patch_dst = Path(output_dir) / "embed_patch.pt"
+    embed_patch_dst.parent.mkdir(parents=True, exist_ok=True)
+    # Load safetensors and save as .pt
+    embed_data = st.load_file(str(embed_path))
+    torch.save(embed_data, embed_patch_dst)
+    logger.info(f"Saved embed_patch.pt to {output_dir}")
 
     # 6. Merge LoRA weights into base model
     logger.info("Step 6: Merging LoRA weights into base model...")

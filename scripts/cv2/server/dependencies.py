@@ -302,51 +302,112 @@ class TTSModel:
 
     def _load_vllm_tokenizer(self) -> None:
         """
-        Load tokenizer from vllm_model_dir for pre-merged vLLM model.
+        Load tokenizer from vllm_model_dir and patch base model embeddings.
 
-        This method loads the tokenizer that was saved together with the merged model,
-        which already includes the special tokens (<PHON_START>, <PHON_END>) with
-        correct token IDs matching the model embeddings.
+        This method:
+        1. Loads the tokenizer from vllm_model_dir (includes special tokens)
+        2. Resizes the base model's embed_tokens to match the tokenizer vocab size
+        3. Patches the special token embeddings from embed_patch.safetensors
+
+        This is necessary because the base model's embed_tokens doesn't include
+        the special tokens (<PHON_START>, <PHON_END>), which would cause IndexError
+        when embedding text containing these tokens.
 
         Note:
-            The tokenizer must have been saved by merge_lora_for_vllm.py.
-            This ensures token IDs match between tokenizer and model embeddings.
+            The tokenizer and embed_patch.safetensors must have been saved by
+            merge_lora_for_vllm.py.
         """
         logger.info("Loading tokenizer from vLLM model directory: %s", self.config.vllm_model_dir)
 
         try:
             from transformers import AutoTokenizer
 
-            # Load tokenizer from vllm_model_dir (includes special tokens)
+            # 1. Load tokenizer from vllm_model_dir (includes special tokens)
             hf_tokenizer = AutoTokenizer.from_pretrained(
                 self.config.vllm_model_dir,
                 trust_remote_code=True
             )
 
-            # Wrap in QwenTokenizer-compatible interface
-            # Get base tokenizer first, then replace internal tokenizer
+            # 2. Get base model's LLM and current embedding
+            base_llm = self.model.model.llm
+            embed_weight = base_llm.llm.model.get_input_embeddings().weight
+            original_vocab_size = embed_weight.size(0)
+            new_vocab_size = len(hf_tokenizer)
+
+            # 3. Define special tokens
+            new_tokens = ["<PHON_START>", "<PHON_END>"]
+
+            # 4. Validate special token IDs
+            new_ids = hf_tokenizer.convert_tokens_to_ids(new_tokens)
+            if any(i < 0 or i >= new_vocab_size for i in new_ids):
+                raise RuntimeError(
+                    f"Special tokens not found in vLLM tokenizer: {new_tokens} -> {new_ids}"
+                )
+
+            # 5. Check if resize is needed
+            # Base model may already have padded vocab (e.g., 151936) that covers special token IDs
+            max_special_id = max(new_ids)
+            if max_special_id >= original_vocab_size:
+                # Need to resize - special tokens are outside current vocab
+                target_vocab_size = new_vocab_size
+                logger.info("Resizing embed_tokens: %d -> %d", original_vocab_size, target_vocab_size)
+                base_llm.llm.model.resize_token_embeddings(target_vocab_size)
+            else:
+                # No resize needed - base model already covers special token IDs
+                logger.info(
+                    "No resize needed: base model vocab (%d) already covers special token IDs (%s)",
+                    original_vocab_size, new_ids
+                )
+
+            # 6. Validate and load embed_patch.pt
+            # NOTE: Using .pt instead of .safetensors to avoid vLLM auto-loading it
+            embed_patch_path = Path(self.config.vllm_model_dir) / "embed_patch.pt"
+            if not embed_patch_path.exists():
+                raise FileNotFoundError(
+                    f"{embed_patch_path} not found. "
+                    "Please run merge_lora_for_vllm.py for this LoRA."
+                )
+
+            logger.info("Loading embed_patch from %s", embed_patch_path)
+            tensor_dict = torch.load(embed_patch_path, map_location=self.device, weights_only=True)
+
+            if "embed_rows" not in tensor_dict:
+                raise ValueError("embed_patch.pt missing 'embed_rows' key")
+
+            rows = tensor_dict["embed_rows"].to(self.device)
+
+            # 7. Validate embed_patch shape
+            embed_weight = base_llm.llm.model.get_input_embeddings().weight
+            if rows.shape != (len(new_tokens), embed_weight.size(1)):
+                raise ValueError(
+                    f"embed_rows shape mismatch: {rows.shape}, "
+                    f"expected ({len(new_tokens)}, {embed_weight.size(1)})"
+                )
+
+            # 8. Patch special token embeddings
+            with torch.no_grad():
+                rows = rows.to(dtype=embed_weight.dtype)
+                embed_weight[new_ids] = rows
+
+            logger.info("Patched special token embeddings: %s -> %s", new_tokens, new_ids)
+
+            # 9. Wrap in QwenTokenizer-compatible interface
             tokenizer_path = f"{self.config.base_model}/CosyVoice-BlankEN"
             tok = get_qwen_tokenizer(
                 token_path=tokenizer_path,
                 skip_special_tokens=True
             )
-
-            # Replace internal tokenizer with the one from vllm_model_dir
             tok.tokenizer = hf_tokenizer
-
-            # Update special tokens metadata
-            new_tokens = ["<PHON_START>", "<PHON_END>"]
             tok.special_tokens["additional_special_tokens"].extend(
                 [t for t in new_tokens if t not in tok.special_tokens["additional_special_tokens"]]
             )
 
-            # Update frontend tokenizer
+            # 10. Update frontend tokenizer
             self.model.frontend.tokenizer = tok
 
-            new_ids = hf_tokenizer.convert_tokens_to_ids(new_tokens)
-            logger.info("Loaded tokenizer with special token IDs: %s", new_ids)
             logger.info("Tokenizer vocab size: %d", len(hf_tokenizer))
-            logger.info("vLLM tokenizer loaded successfully")
+            logger.info("Special token IDs: %s", new_ids)
+            logger.info("vLLM tokenizer loaded and embeddings patched successfully")
 
         except Exception as e:
             logger.error("Failed to load vLLM tokenizer: %s", e)
